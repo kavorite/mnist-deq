@@ -12,7 +12,6 @@ import sam
 from deq import DEQCore, DEQSolver
 
 
-@hk.without_apply_rng
 @hk.transform
 def model(x):
     x = (x - 127.5) / 255.0
@@ -22,16 +21,19 @@ def model(x):
 
     x = hk.Linear(128, name="downsample")(flatten(x))
     x = hk.LayerNorm(-1, True, True)(x)
-    core = DEQCore(
-        hk.Linear(128, name="cell_proj"),
-        DEQSolver(wrap=dax.Tsit5(scan_stages=False)),
-    )
+
+    def cell(z):
+        z = hk.Linear(128, name="cell_proj")(z)
+        return hk.dropout(hk.next_rng_key(), 0.1, z)
+
+    solver = DEQSolver(wrap=dax.Tsit5(scan_stages=False), atol=1e-4, max_depth=64)
+    core = DEQCore(cell, solver)
     z_init, z_star = map(flatten, core(x))
     logits = hk.Linear(10, name="classifier")(z_star)
     return {"z_init": z_init, "z_star": z_star, "logits": logits}
 
 
-def loss_fn(params, x, y, return_output=False):
+def loss_fn(params, rng, x, y, return_output=False):
     def sup_con(p, t):
         p /= optax.safe_norm(p, 1e-4, axis=-1, keepdims=True)
         t /= t.sum(axis=-1, keepdims=True)
@@ -39,17 +41,18 @@ def loss_fn(params, x, y, return_output=False):
             p @ p.swapaxes(-1, -2), t @ t.swapaxes(-1, -2)
         )
 
-    output = model.apply(params, x)
+    output = model.apply(params, rng, x)
 
     logits = output["logits"]
     labels = jax.nn.one_hot(y, 10)
     latent = output["z_star"]
 
-    loss = (
-        optax.softmax_cross_entropy(logits, labels).mean()
-        + 0.01 * jnp.abs(output["z_init"] - output["z_star"]).sum()
+    rgterm = (
+        0.01 * jnp.abs(output["z_init"] - output["z_star"]).sum()
         + 5e-3 * sup_con(latent, labels).mean()
     )
+    loss = optax.softmax_cross_entropy(logits, labels).mean() + rgterm
+    output["rgterm"] = rgterm
 
     if return_output:
         return loss, output
@@ -61,13 +64,13 @@ def chunks(arr, size, axis=0):
     return np.split(arr, range(size, len(arr), size), axis=axis)
 
 
-def mkopt(steps, x, y):
+def mkopt(steps, rng, x, y):
     msched = optax.linear_onecycle_schedule(steps, 0.95, div_factor=0.95 / 0.85)
-    lsched = optax.linear_onecycle_schedule(steps, 1e-3)
-    dsched = optax.linear_onecycle_schedule(steps, 1e-4)
+    lsched = lambda step: 1e-3  # optax.linear_onecycle_schedule(steps, 1e-3)
+    dsched = lambda step: 1e-5  # optax.linear_onecycle_schedule(steps, 1e-4)
 
     def climb_fn(params):
-        return jax.grad(loss_fn)(params, x, y)
+        return jax.grad(loss_fn)(params, rng, x, y)
 
     def non_norm(module, name, value):
         del name
@@ -100,15 +103,17 @@ def main():
 
     def train_init(steps, rng, x, y):
         params = model.init(rng, x)
-        opt_st = mkopt(steps, x, y).init(params)
+        opt_st = mkopt(steps, rng, x, y).init(params)
         return TrainState(params, opt_st, loss=0.0, step=0)
 
     @partial(jax.jit, donate_argnums=1, static_argnums=0)
-    def train_step(steps, state, x, y):
+    def train_step(steps, state, rng, x, y):
         (loss, output), grads = jax.value_and_grad(loss_fn, has_aux=True)(
-            state.params, x, y, return_output=True
+            state.params, rng, x, y, return_output=True
         )
-        params, opt_st = mkopt(steps, x, y).update(grads, state.opt_st, state.params)
+        params, opt_st = mkopt(steps, rng, x, y).update(
+            grads, state.opt_st, state.params
+        )
         step_inc = optax.safe_int32_increment(state.step)
         loss_avg = (state.loss * state.step + loss) / step_inc
         state = TrainState(params, opt_st, loss=loss_avg, step=step_inc)
@@ -127,14 +132,15 @@ def main():
         total = str(steps).rjust(digits, "0")
         acc = np.mean(output["logits"].argmax(axis=-1) == labels)
         acc_avg = ((state.step - 1) * acc_avg + acc) / state.step
-        return f"step {step}/{total}: loss = {state.loss:.3g} acc = {acc_avg:.3g}"
+        loss = state.loss - output["rgterm"]
+        return f"step {step}/{total}: loss = {loss:.3g} acc = {acc_avg:.3g}"
 
     def data():
         while True:
             yield from zip(X, Y)
 
     for i, (x, y) in enumerate(data()):
-        state, output = train_step(steps, state, x, y)
+        state, output = train_step(steps, state, next(rng), x, y)
         print(status(i + 1, state, output, y), end=" " * 16 + "\r")
         if i == steps - 1:
             break
